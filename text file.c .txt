@@ -1,0 +1,201 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+
+#define MEM_SIZE 1048576 //1KB
+#define SHM_NAME "PROC_SHM"
+#define MAX_BUF 65536
+
+
+int parse_lines(char *mem){
+int count = 0;
+int i = 0;
+while (mem[i] != '\0') {
+//check if there is new line
+if (mem[i] == '\n'){
+count++;
+mem[i] = '\0';
+// changing the newline to null
+
+}
+i++;
+}
+//check if there is a new line before the null char
+
+if(i > 0 && mem[i - 1] == '\n'){
+mem[i - 1] = '\0';
+count--;
+}
+//if there are n newline character, then would be n + 1 lines
+return count + 1;
+}
+
+int parse_args(char* cmd){
+int args = 0;
+int len = strlen(cmd);
+for(int i = 0; i < len; i++){
+if(cmd[i] == ' '){
+cmd[i] = '\0';
+args++;
+}
+}
+return args + 1;
+}
+
+//output
+void writeOutput(char* command, char* output)
+{
+printf("The output of: %s : is\n", command);
+printf(">>>>>>>>>>>>>>>\n%s<<<<<<<<<<<<<<<\n", output);
+}
+
+//this function is executed by the child process 
+void exec_child(char* const args[], int writepipe_fd){
+//parse the command
+//changing the OUTPUT file
+if(dup2(writepipe_fd, STDOUT_FILENO) == -1){
+//error
+perror("error dup2");
+exit(-1);
+}
+execvp(args[0] , args);
+}
+
+int main(int argc, char* argv[]){
+
+//checking arguments
+if(argc != 2){
+fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
+exit(-1);
+}
+//okay create the shared memory area
+int shared_fd = shm_open(SHM_NAME , O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+//check if successfull
+if(shared_fd < 0){
+
+perror("Error initiating shared memory");
+exit(-1);
+}
+//set the size for shared memory
+if(ftruncate(shared_fd , MEM_SIZE) == -1){
+perror("ftruncate error");
+exit(-1);
+}
+// map the file to virtual memory
+char *memory = mmap(NULL , MEM_SIZE , PROT_READ | PROT_WRITE , MAP_SHARED , shared_fd , 0);
+//check if map is successfull
+if(memory == (char *)-1){
+perror("Memory error");
+exit(-1);
+}
+
+// Now the child is ready to read the files
+if(fork() == 0){
+//this is the child
+
+FILE *fp = fopen(argv[1], "r");
+//check if file opened
+if(fp == NULL){
+//unable to open file
+//exit with code - 1
+exit(-1);
+}
+//read the contents
+int n_read = fread(memory , 1 , MEM_SIZE - 1, fp);
+//add the null byte
+if(n_read == 0){
+//unable to read
+exit(-1);
+}
+//add null character
+memory[n_read] = '\0';
+//exit
+exit(0);
+}
+
+//this is the parent
+//waiting for the child
+int status;
+wait(&status);
+//chech if child was successfull
+if(WEXITSTATUS(status) == -1){
+//some error occurred
+perror("Error");
+exit(-1);
+}
+
+int n_lines = parse_lines(memory);
+//alllocate the command array
+char** commands = malloc(sizeof(char*) * n_lines);
+//now copy each command
+int offset = 0; 
+for(int i = 0; i < n_lines ; i++){
+commands[i] = strdup(memory + offset);
+//update offset
+offset += strlen(commands[i]) + 1; 
+}
+//all commands are copied
+
+munmap(memory , MEM_SIZE);
+close(shared_fd); 
+
+
+char* buf = malloc(sizeof(char) * MAX_BUF);
+//repeat for each child
+for(int i = 0; i < n_lines; i++){
+//parse the command
+char* newcmd = strdup(commands[i]);
+int argc = parse_args(newcmd);
+//create a new commands array
+char* args_array[argc + 1];
+//set the pointer
+int arg_offset = 0;
+for(int i = 0; i < argc; i++){
+args_array[i] = newcmd + arg_offset;
+arg_offset += strlen(args_array[i]) + 1;
+}
+//set null in last
+args_array[argc] = NULL;
+//create a pipe
+int pipefd[2];
+if(pipe(pipefd) == -1){
+perror("Pipe error");
+exit(-1);
+}
+//call fork and create a child
+if(fork() == 0){
+//this is the child
+//close the read end
+close(pipefd[0]);
+//execute the command
+exec_child(args_array , pipefd[1]);
+exit(0);
+}
+//this is the parent
+close(pipefd[1]);
+//wait for the child
+wait(NULL);
+//get the output of the pipe as string
+int read_n = read(pipefd[0], buf , MAX_BUF - 1);
+//close the pipe
+close(pipefd[0]);
+buf[read_n] = '\0';
+//output
+writeOutput(commands[i], buf);
+free(newcmd);
+}
+
+free(buf);
+for(int i = 0; i < n_lines; i++){
+free(commands[i]);
+}
+free(commands);
+return 0;
+}
